@@ -161,9 +161,6 @@ marimo/_lsp/
 __marimo__/
 
 # data
-/data/raw/
-/data/interim/
-/data/processed/
 /logs/
 
 # OS/editor
