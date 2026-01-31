@@ -31,6 +31,8 @@ __all__ = [
     "label_regimes",
     "transition_matrix",
     "nearest_regimes_by_hmm_no_gap",
+    "compute_similarity_quintiles",
+    "compute_rolling_similarity_quintiles",
 ]
 
 
@@ -42,7 +44,7 @@ class RegimeModelConfig:
     covariance_type: str = "full"
     n_iter: int = 1000
     random_state: int = 42
-    label_order_feature: str = "volatility_level"
+    label_order_feature: str = "volatility_transformed"
 
 
 def load_feature_matrix(path: str | Path, date_col: str = "date") -> pd.DataFrame:
@@ -150,8 +152,9 @@ def fit_hmm(
 def _pick_order_feature(features: pd.DataFrame, preferred: str) -> str:
     if preferred in features.columns:
         return preferred
+    # Try to find volatility column with new naming convention
     for col in features.columns:
-        if "volatility" in col:
+        if "volatility" in col.lower():
             return col
     return features.columns[0]
 
@@ -203,3 +206,141 @@ def nearest_regimes_by_hmm_no_gap(
     if exclude_self and date in dist.index:
         dist = dist.drop(date)
     return dist.sort_values().head(k)
+
+
+def compute_similarity_quintiles(
+    features: pd.DataFrame,
+    target_date: pd.Timestamp,
+    metric: str = "mahalanobis",
+    standardize: bool = True,
+    n_quintiles: int = 5,
+    min_history: int = 60,
+) -> pd.DataFrame:
+    """
+    Compute similarity quintiles for a single target date using only prior dates.
+    
+    Parameters:
+    -----------
+    features : pd.DataFrame
+        Feature matrix with DatetimeIndex
+    target_date : pd.Timestamp
+        The date to find similar historical periods for
+    metric : str
+        Distance metric: 'mahalanobis', 'euclidean', or 'correlation'
+    standardize : bool
+        Whether to standardize features before computing distances
+    n_quintiles : int
+        Number of quintiles (default: 5)
+    min_history : int
+        Minimum number of historical dates required (default: 60 months)
+    
+    Returns:
+    --------
+    pd.DataFrame
+        DataFrame with columns: date, distance, quintile (1=most similar)
+    """
+    # Only use dates strictly before target_date (no look-ahead)
+    prior_dates = features.index[features.index < target_date]
+    
+    if len(prior_dates) < min_history:
+        return pd.DataFrame(columns=['date', 'distance', 'quintile'])
+    
+    # Prepare features
+    X_prior = features.loc[prior_dates].to_numpy(dtype=float)
+    X_target = features.loc[[target_date]].to_numpy(dtype=float)
+    
+    if standardize:
+        scaler = StandardScaler()
+        X_prior = scaler.fit_transform(X_prior)
+        X_target = scaler.transform(X_target)
+    
+    # Compute distances
+    if metric == "mahalanobis":
+        cov = np.cov(X_prior, rowvar=False)
+        VI = np.linalg.pinv(cov)
+        diff = X_prior - X_target
+        distances = np.sqrt(np.sum(diff @ VI * diff, axis=1))
+    elif metric == "euclidean":
+        distances = np.linalg.norm(X_prior - X_target, axis=1)
+    elif metric == "correlation":
+        # Correlation distance = 1 - correlation
+        target_centered = X_target - X_target.mean()
+        prior_centered = X_prior - X_prior.mean(axis=1, keepdims=True)
+        
+        target_norm = np.linalg.norm(target_centered)
+        prior_norms = np.linalg.norm(prior_centered, axis=1)
+        
+        correlations = (prior_centered @ target_centered.T).flatten() / (prior_norms * target_norm + 1e-10)
+        distances = 1 - correlations
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+    
+    # Create result DataFrame
+    result = pd.DataFrame({
+        'date': prior_dates,
+        'distance': distances,
+    })
+    
+    # Assign quintiles (1 = most similar = lowest distance)
+    result['quintile'] = pd.qcut(
+        result['distance'], 
+        q=n_quintiles, 
+        labels=range(1, n_quintiles + 1),
+        duplicates='drop'
+    )
+    
+    return result.sort_values('distance')
+
+
+def compute_rolling_similarity_quintiles(
+    features: pd.DataFrame,
+    metric: str = "mahalanobis",
+    standardize: bool = True,
+    n_quintiles: int = 5,
+    min_history: int = 60,
+) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """
+    Compute similarity quintiles for all dates in the feature matrix.
+    
+    This function computes, for each date t, the similarity of all prior dates
+    to date t, ranked into quintiles. This is done in a rolling/expanding manner
+    to avoid look-ahead bias.
+    
+    Parameters:
+    -----------
+    features : pd.DataFrame
+        Feature matrix with DatetimeIndex
+    metric : str
+        Distance metric: 'mahalanobis', 'euclidean', or 'correlation'
+    standardize : bool
+        Whether to standardize features before computing distances
+    n_quintiles : int
+        Number of quintiles (default: 5)
+    min_history : int
+        Minimum number of historical dates required (default: 60 months)
+    
+    Returns:
+    --------
+    Dict[pd.Timestamp, pd.DataFrame]
+        Dictionary mapping each target date to its similarity DataFrame
+    """
+    results = {}
+    dates = features.index.tolist()
+    
+    for i, target_date in enumerate(dates):
+        if i < min_history:
+            continue
+            
+        quintile_df = compute_similarity_quintiles(
+            features=features,
+            target_date=target_date,
+            metric=metric,
+            standardize=standardize,
+            n_quintiles=n_quintiles,
+            min_history=min_history,
+        )
+        
+        if not quintile_df.empty:
+            results[target_date] = quintile_df
+    
+    return results
